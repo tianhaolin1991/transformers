@@ -190,10 +190,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            that cos[position_ids] and sin[position_ids] have the shape [bsz, seq_len, head_dim]. Then, if q and
+            k have the shape [bsz, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
             cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+            the shape [bsz, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
@@ -216,7 +216,7 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
+        if self.config.pretraining_tp > 1: ## config.pretraining_tp,tp表示tensor parallel张量并行
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
@@ -237,7 +237,11 @@ class LlamaMLP(nn.Module):
 
         return down_proj
 
-
+"""
+使用一个二维矩阵举例:
+[[1,2,3,4],[5,6,7,8]]
+-> [[1,2,3,4],[1,2,3,4],[5,6,7,8],[5,6,7,8]]
+"""
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -279,7 +283,8 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-
+        # q/k/v/o 都是torch.nn.Linear类型,Linear用于线性变换
+        # 如m=nn.Linear(x,y,True) m(tensor)可以将tensor从[*,x]->[*.y]
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -344,14 +349,21 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
+            # 将q/k/v进行线性变换-> [B,S,HIDDEN] -> [B,S,D]
+            # 把hidden_states进行线性变换tensor[bsz,seq_len,hidden_size]->tensor[bsz,seq_len,hidden_size]
             query_states = self.q_proj(hidden_states)
+            # 把hidden_states进行线性变换tensor[bsz,seq_len,hidden_size]->tensor[bsz,seq_len,num_key_value_heads * head_dim]
             key_states = self.k_proj(hidden_states)
+            # 把hidden_states进行线性变换tensor[bsz,seq_len,hidden_size]->tensor[bsz,seq_len,num_key_value_heads * head_dim]
             value_states = self.v_proj(hidden_states)
-
+        # 将q/k/v进行线性变换-> [B,S,D] -> [B,HEAD,S,d]
+        # tensor[bsz,seq_len,hidden_size] -> tensor[bsz,num_heads,seq_length,head_dim]
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # tensor[bsz,seq_len,num_key_value_heads * head_dim]->[bsz,num_key_value_heads,seq_length,head_dim]
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # tensor[bsz,seq_len,num_key_value_heads * head_dim]->[bsz,num_key_value_heads,seq_length,head_dim]
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
+        # 添加位置编码
         past_key_value = getattr(self, "past_key_value", past_key_value)
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -360,12 +372,14 @@ class LlamaAttention(nn.Module):
             # sin and cos are specific to RoPE models; position_ids needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
+        # [bsz,num_key_value_heads,seq_length,head_dim]->[bsz,num_heads,seq_length,head_dim]
         key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # [bsz,num_key_value_heads,seq_length,head_dim]->[bsz,num_heads,seq_length,head_dim]
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+        # 计算attn_weights,详见self_attn公式
+        # attn_weights tensor[B,HEAD,S,S]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+        # attention mask
         if attention_mask is not None:  # no matter the length, we just slice it
             if cache_position is not None:
                 causal_mask = attention_mask[:, :, cache_position, : key_states.shape[-2]]
@@ -374,6 +388,7 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_output->[B,HEAD,S,d]
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -381,9 +396,9 @@ class LlamaAttention(nn.Module):
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-
+        # attn_output->[B,S,HEAD,d]
         attn_output = attn_output.transpose(1, 2).contiguous()
-
+        # attn_output->[B,S,HEAD,d]-> [B,S,HIDDEN]
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         if self.config.pretraining_tp > 1:
@@ -434,7 +449,7 @@ class LlamaFlashAttention2(LlamaAttention):
         value_states = self.v_proj(hidden_states)
 
         # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
+        # bsz x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -450,7 +465,7 @@ class LlamaFlashAttention2(LlamaAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [bsz, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -511,7 +526,7 @@ class LlamaFlashAttention2(LlamaAttention):
             value_states (`torch.Tensor`):
                 Input value states to be passed to Flash Attention API
             attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
+                The padding mask - corresponds to a tensor of size `(bsz, seq_len)` where 0 stands for the
                 position of padding tokens and 1 for the position of non-padding tokens.
             dropout (`int`, *optional*):
                 Attention dropout
@@ -526,7 +541,7 @@ class LlamaFlashAttention2(LlamaAttention):
 
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
-            batch_size = query_states.shape[0]
+            bsz = query_states.shape[0]
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
                 query_states, key_states, value_states, attention_mask, query_length
             )
@@ -547,7 +562,7 @@ class LlamaFlashAttention2(LlamaAttention):
                 causal=causal,
             )
 
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+            attn_output = pad_input(attn_output_unpad, indices_q, bsz, query_length)
         else:
             attn_output = flash_attn_func(
                 query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
@@ -557,17 +572,17 @@ class LlamaFlashAttention2(LlamaAttention):
 
     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+        bsz, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+            key_layer.reshape(bsz * kv_seq_len, num_key_value_heads, head_dim), indices_k
         )
         value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+            value_layer.reshape(bsz * kv_seq_len, num_key_value_heads, head_dim), indices_k
         )
         if query_length == kv_seq_len:
             query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
+                query_layer.reshape(bsz * kv_seq_len, self.num_heads, head_dim), indices_k
             )
             cu_seqlens_q = cu_seqlens_k
             max_seqlen_in_batch_q = max_seqlen_in_batch_k
@@ -575,7 +590,7 @@ class LlamaFlashAttention2(LlamaAttention):
         elif query_length == 1:
             max_seqlen_in_batch_q = 1
             cu_seqlens_q = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=query_layer.device
+                bsz + 1, dtype=torch.int32, device=query_layer.device
             )  # There is a memcpy here, that is very bad.
             indices_q = cu_seqlens_q[:-1]
             query_layer = query_layer.squeeze(1)
@@ -687,16 +702,25 @@ LLAMA_ATTENTION_CLASSES = {
 
 
 class LlamaDecoderLayer(nn.Module):
+    """
+    LlamDecoderLayer有三个算子:
+        self_attn:自注意力层
+        mlp: Multilayer Perceptron,
+             多层感知机（MLP）层用于在每个位置上对特征进行非线性变换，以增强模型的表示能力。它通过堆叠多个全连接层和激活函数来实现这一点。
+        norm: 标准化层
+    """
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    """
+    input_layernorm->self_attn->post_attention_layernorm->mlp->output
+    """
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -712,7 +736,7 @@ class LlamaDecoderLayer(nn.Module):
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
             attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                attention mask of size `(bsz, sequence_length)` if flash attention is used or `(bsz, 1,
                 query_sequence_length, key_sequence_length)` if default attention is used.
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
@@ -726,12 +750,14 @@ class LlamaDecoderLayer(nn.Module):
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
-
+        # 引入残差
         residual = hidden_states
-
+        # 1.对hidden_states即输入进行normalize
         hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
+        # 2.进行self_attn
+        # hidden_states:即通过QKV计算的输出,这个张量表示了经过注意力机制后模型对输入序列的理解或者表示
+        # self_attn_weights:自注意力权重，表示模型在进行自注意力计算时，对输入序列中每个位置的重要性或关注程度
+        # present_key_value:包含了缓存的过去的键-值状态，用于加速解码过程
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -742,10 +768,12 @@ class LlamaDecoderLayer(nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
+        # 加上残差
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
+        # 经过post attention layer和mlp layer
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
@@ -803,7 +831,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-    def _setup_cache(self, cache_cls, max_batch_size, max_cache_len: Optional[int] = None):
+    def _setup_cache(self, cache_cls, max_bsz, max_cache_len: Optional[int] = None):
         if self.config._attn_implementation == "flash_attention_2" and cache_cls == StaticCache:
             raise ValueError(
                 "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -817,7 +845,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
         for layer in self.model.layers:
             weights = layer.self_attn.o_proj.weight
             layer.self_attn.past_key_value = cache_cls(
-                self.config, max_batch_size, max_cache_len, device=weights.device, dtype=weights.dtype
+                self.config, max_bsz, max_cache_len, device=weights.device, dtype=weights.dtype
             )
 
     def _reset_cache(self):
@@ -827,7 +855,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 LLAMA_INPUTS_DOCSTRING = r"""
     Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+        input_ids (`torch.LongTensor` of shape `(bsz, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
             it.
 
@@ -835,7 +863,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
-        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+        attention_mask (`torch.Tensor` of shape `(bsz, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
 
             - 1 for tokens that are **not masked**,
@@ -855,7 +883,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
 
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
-        position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        position_ids (`torch.LongTensor` of shape `(bsz, sequence_length)`, *optional*):
             Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
             config.n_positions - 1]`.
 
@@ -868,16 +896,16 @@ LLAMA_INPUTS_DOCSTRING = r"""
             Two formats are allowed:
             - a [`~cache_utils.Cache`] instance;
             - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
-            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
+            shape `(bsz, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
             cache format.
 
             The model will output the same cache format that is fed as input. If no `past_key_values` are passed, the
             legacy cache format will be returned.
 
             If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
-            have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
-            of shape `(batch_size, sequence_length)`.
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            have their past key value states given to this model) of shape `(bsz, 1)` instead of all `input_ids`
+            of shape `(bsz, sequence_length)`.
+        inputs_embeds (`torch.FloatTensor` of shape `(bsz, sequence_length, hidden_size)`, *optional*):
             Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
             is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
             model's internal embedding lookup matrix.
@@ -911,16 +939,24 @@ class LlamaModel(LlamaPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        # self.embed_tokens是一个Embedding,定义了vocab_size和hidden_size之后,可以对input_ids进行embedding
+        # 参数量 v * h
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # layers由多个基础的LlamDecoderLayer组成
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        # Nomalize 使用LlmaRMSNorm
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
-
+        # 这里的causal mask 是一个config.max_position_embeddings * config.max_position_embeddings维度的矩阵,并且所有元素都是1
         # register a causal mask to separate causal and padding mask creation. Merging happends in the attention class
         causal_mask = torch.full((config.max_position_embeddings, config.max_position_embeddings), fill_value=1)
+        """
+        causal_mask 是一个全1矩阵，表示在自注意力机制中每个位置都可以依赖于它之前的位置。
+        torch.triu(causal_mask, diagonal=1) 将会保留 causal_mask 中的上三角部分
+        对角线上的元素也会被保留，但对角线以下的元素将被置为0，这正是我们想要的因果掩码的形式。
+        """
         self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
         # Initialize weights and apply final processing
         self.post_init()
@@ -1056,7 +1092,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 return attention_mask
             return None
 
-        batch_size, seq_length = input_tensor.shape[:2]
+        bsz, seq_length = input_tensor.shape[:2]
         dtype = input_tensor.dtype
         device = input_tensor.device
 
@@ -1066,7 +1102,7 @@ class LlamaModel(LlamaPreTrainedModel):
             self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
 
         # We use the current dtype to avoid any overflows
-        causal_mask = self.causal_mask[None, None, :, :].repeat(batch_size, 1, 1, 1).to(dtype) * torch.finfo(dtype).min
+        causal_mask = self.causal_mask[None, None, :, :].repeat(bsz, 1, 1, 1).to(dtype) * torch.finfo(dtype).min
 
         causal_mask = causal_mask.to(dtype=dtype, device=device)
         if attention_mask is not None and attention_mask.dim() == 2:
@@ -1142,7 +1178,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            labels (`torch.LongTensor` of shape `(bsz, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
@@ -1184,26 +1220,52 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             return_dict=return_dict,
             cache_position=cache_position,
         )
-
+        # 输出是一个CausalLMOutputWithPast,取[0]就是last_hidden_state
         hidden_states = outputs[0]
+        # logits通常指的是全连接层的输出,通常是未经过 softmax 或其他激活函数的原始输出
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
+            # [B,S,HIDDEN] -> [B,S,VOCAB]
             logits = self.lm_head(hidden_states)
+        # 将Tensor转换为float类型
         logits = logits.float()
 
         loss = None
+        # 计算Loss
         if labels is not None:
             # Shift so that tokens < n predict n
+            """
+            logits[..., :-1, :]
+            假设logits->Shape[B,S,V]
+            '...'表示倒数第二个之前的维度,也就是B,不变,如果是四维就是前两维不变
+            ':-1'表示倒数第二个维度舍弃最后一个元素,也就是S->S-1
+            ':'表示保留最后一个维度的所有元素
+            
+            """
+            # logits[..., :-1, :] : logits Shape[B,S,V]->[B,S[:-1],V]
+            # cotiguous()可以让Tensor的内存变成连续的
             shift_logits = logits[..., :-1, :].contiguous()
+            # labels Shape[B,S,V]->[B,S[1:],V]
             shift_labels = labels[..., 1:].contiguous()
+            """
+            为什么要这样处理LABELS和SHIFT_LOGITS
+            比如我们模型的input是[A,B,C,D]这里我忽略了tokenize和embedding的过程
+            我们给模型的labels是[A,B,C,D]
+            我们的到的logits实际是输入[A,B,C,D]后面的输出,假设模型预测是X
+            logits=[B',C',D',X],其中B',C',D'也都是模型预测的结果
+            那我们计算LOSS时候,需要取lebels[1:],和logits[:-1],也就是综合对比A,A';B,B';C,C',算出loss
+            """
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
+            # [B,S,V]->[B*S,V]
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            # [B,S,V]->[B*S*V]
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
+            # tensor.to将张量转移到某个设备
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
@@ -1350,7 +1412,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+        labels (`torch.LongTensor` of shape `(bsz,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
@@ -1372,11 +1434,11 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         logits = self.score(hidden_states)
 
         if input_ids is not None:
-            batch_size = input_ids.shape[0]
+            bsz = input_ids.shape[0]
         else:
-            batch_size = inputs_embeds.shape[0]
+            bsz = inputs_embeds.shape[0]
 
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and bsz != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         if self.config.pad_token_id is None:
             sequence_lengths = -1
@@ -1389,7 +1451,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             else:
                 sequence_lengths = -1
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        pooled_logits = logits[torch.arange(bsz, device=logits.device), sequence_lengths]
 
         loss = None
         if labels is not None:
@@ -1465,11 +1527,11 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+        start_positions (`torch.LongTensor` of shape `(bsz,)`, *optional*):
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
             Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
             are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+        end_positions (`torch.LongTensor` of shape `(bsz,)`, *optional*):
             Labels for position (index) of the end of the labelled span for computing the token classification loss.
             Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
             are not taken into account for computing the loss.
