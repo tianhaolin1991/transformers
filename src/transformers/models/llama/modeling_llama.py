@@ -1445,14 +1445,55 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         else:
             if input_ids is not None:
                 # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+                # 1.eq(input_ids,pad_token_id)这里首先找到torch.eq找到input_ids中为pad_token_id的元素(相同True,不同False)返回的张量也为[B,S,H]
+                # 2.int()将布尔值转换为int值返回的张量也为[B,S]
+                # 3.argmax(-1)沿着最后一个维度(S)找到最大值索引,即shape是[B,S]每个元素都是其在S上最大值的索引
                 sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                # 这一步 sequence_lengths = sequence_lengths % input_ids.shape[-1] 是对 sequence_lengths 中的每个元素执行取模运算
+                # 其中取模的除数是 input_ids 张量的最后一个维度的大小（input_ids.shape[-1]）。
+                # 这样做可能是为了处理在计算序列长度时可能出现的异常情况，确保结果始终在有效的索引范围内，避免越界错误,比如没有pad_token,argmax(-1)-1会返回-1
+                # 经过这一步计算会修正为
                 sequence_lengths = sequence_lengths % input_ids.shape[-1]
                 sequence_lengths = sequence_lengths.to(logits.device)
             else:
                 sequence_lengths = -1
-
+        #torch.arange(bsz, device=logits.device)：这创建了一个张量，包含从 0 到 bsz-1 的值。在这个上下文中，它表示批次维度的索引。
+        #sequence_lengths：这个张量包含每个批次的序列长度。这些值表示我们想要从 logits 张量中提取 logits 的沿着序列维度的索引位置。
+        #当这两个张量用于索引时，它实际上意味着从每个批次中选择 logits，选择的位置由相应的 sequence_lengths 指定。最终的张量 pooled_logits 将包含这些特定位置的 logits
+        #所以这里最终取得的是最后一个非pad token计算出的Logits.也就是每个句子输入完整信息后得的推理
         pooled_logits = logits[torch.arange(bsz, device=logits.device), sequence_lengths]
-
+        """
+            import torch 
+            input_ids = torch.tensor([[1, 5, 2, 0, 0],
+                                   [6, 7, 8, 9, 0],
+                                   [21, 22, 23, 24, 25]])  # shape: (3, 5)
+            logits = torch.tensor([[0.0, 0.1, 0.2, 0.3, 0.4],
+                                [1.0, 1.1, 1.2, 1.3, 1.4],
+                                [3.0, 3.1, 3.2, 3.3, 3.4]])  # shape: (3, 5)
+            pad_token_id = 0
+            #tensor(
+            # [[False, False, False,  True,  True],
+            # [False, False, False, False,  True],
+            # [False, False, False, False, False]])
+            tensor = torch.eq(input_ids, pad_token_id)
+            #tensor(
+            # [[0, 0, 0, 1, 1],
+            # [0, 0, 0, 0, 1],
+            # [0, 0, 0, 0, 0]])
+            tensor = tensor.int()
+            # tensor([3, 4, 0])
+            tensor = tensor.argmax(-1)
+            # tensor([2, 3, -1])
+            sequence_lengths = tensor - 1
+            # tensor([2, 3, 4])
+            sequence_lengths = sequence_lengths % input_ids.shape[-1]
+            # 3
+            bsz = input_ids.shape[0]
+            # tensor([0,1,2])
+            first = torch.arange(bsz)
+            # tensor([0.2000, 1.3000, 3.4000])
+            pooled_logits = logits[first, sequence_lengths]
+        """
         loss = None
         if labels is not None:
             labels = labels.to(logits.device)
@@ -1472,6 +1513,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
+                # https://zhuanlan.zhihu.com/p/577542109?utm_id=0 交叉熵
+                # https://zhuanlan.zhihu.com/p/35709485 损失函数和反向传播
                 loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
